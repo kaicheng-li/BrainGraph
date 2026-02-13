@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 
 from .llama_config import LlamaConfig
+from .graph_encoder import GraphEncoder
+from .fusion_layer import GraphTextFusion
+from .rope_extended import NTKScaledRoPE, apply_rotary_pos_emb
 
 class RMSNorm(nn.Module):
     """
@@ -215,169 +218,105 @@ class FeedForward(nn.Module):
 
 class SelfAttention(nn.Module):
     """
-    多头自注意力（不含 RoPE、KV cache，先实现最基本版本）
+    升级版自注意力：支持NTK-RoPE长上下文扩展
+    论文：
+    - RoPE (Su et al., 2021)
+    - NTK-aware scaling (Bloc97, 2023)
     """
-
     def __init__(self, config: LlamaConfig):
         super().__init__()
-
+        
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads 
-        self.rope_theta = config.rope_theta
-
-        # 每个头的维度 = hidden_size / 头数
-        assert self.hidden_size % self.num_heads == 0, "hidden_size 必须能整除 num_attention_heads"
+        self.num_kv_heads = config.num_key_value_heads
         self.head_dim = self.hidden_size // self.num_heads
         
-        # === KV Cache关键修改1：计算分组数 ===
-        # num_kv_groups = 每组有多少个Q头共享1组KV
-        # 例如：32 ÷ 8 = 4（每4个Q头共享1组KV）
-        assert self.num_heads % self.num_kv_heads == 0, "num_heads 必须能整除 num_kv_heads"
+        assert self.hidden_size % self.num_heads == 0
+        assert self.num_heads % self.num_kv_heads == 0
         self.num_kv_groups = self.num_heads // self.num_kv_heads
-
-        # 把输入投影到 Q / K / V 三个空间
+        
+        # Linear projections
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-        # K/V投影：输出维度 = num_kv_heads * head_dim（比Q小！）
-        # 例如：8 * 64 = 512，而Q是 32 * 64 = 2048
         kv_hidden_size = self.num_kv_heads * self.head_dim
-        self.k_proj = nn.Linear(self.hidden_size, kv_hidden_size, bias=False)  # ← 改这里
-        self.v_proj = nn.Linear(self.hidden_size, kv_hidden_size, bias=False)  # ← 改这里
-
-
-        # 注意力输出再映射回 hidden_size
+        self.k_proj = nn.Linear(self.hidden_size, kv_hidden_size, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, kv_hidden_size, bias=False)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
-
+        
+        # === NTK-RoPE初始化 ===
+        rope_scaling = config.rope_scaling
+        if rope_scaling and rope_scaling.get("type") == "ntk":
+            scaling_factor = rope_scaling.get("factor", 1.0)
+        else:
+            scaling_factor = 1.0
+        
+        self.rotary_emb = NTKScaledRoPE(
+            dim=self.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base_theta=config.rope_theta,
+            scaling_factor=scaling_factor
+        )
+        
+        print(f"  ✓ SelfAttention使用NTK-RoPE，scaling_factor={scaling_factor}")
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        """
-        hidden_states: [B, T, C]
-        past_key_value: (k_cache, v_cache)
-          - k_cache: [B, num_kv_heads, past_len, head_dim]
-          - v_cache: [B, num_kv_heads, past_len, head_dim]
-        """
         bsz, seq_len, _ = hidden_states.shape
-
-        # 1. 线性投影得到 Q, K, V
-        q = self.q_proj(hidden_states)  # [B, T, C]
-        k = self.k_proj(hidden_states)  # [B, T, C]
-        v = self.v_proj(hidden_states)  # [B, T, C]
-
-        # 1) 准备频率：inv_freq 形状 [head_dim/2]
-        dim = self.head_dim
-        device = hidden_states.device
-
-        inv_freq = 1.0 / (
-            self.rope_theta ** (
-                torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim
-            )
-        )  # [dim/2]
-
-        # 2) 位置索引：0,1,...,T-1
-        t = torch.arange(seq_len, device=device, dtype=torch.float32)  # [T]
-
-        # 3) 外积得到角度矩阵 freqs: [T, dim/2]
-        freqs = torch.einsum("i,j->ij", t, inv_freq)  # [T, dim/2]
-
-        # 4) 拼成 dim 维，并算出 cos/sin
-        emb = torch.cat([freqs, freqs], dim=-1)  # [T, dim]
-        cos = emb.cos()[None, None, :, :]  # [1, 1, T, dim]
-        sin = emb.sin()[None, None, :, :]  # [1, 1, T, dim]
-
-        # 5) 定义一个帮助函数，旋转后一半
-        def rotate_half(x: torch.Tensor) -> torch.Tensor:
-            x1, x2 = x[..., : dim // 2], x[..., dim // 2 :]
-            return torch.cat([-x2, x1], dim=-1)
-
-        # 6) 先 reshape 成 [B, T, H, D] 再应用 RoPE
-        q = q.view(bsz, seq_len, self.num_heads, self.head_dim)  # [B, T, H, D]
-        k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim)  # [B, T, H, D]
-        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim)  # [B, T, H, D]
-        # 为了和 [1,1,T,D] 的 cos/sin 对齐，把 T 维放到后面：[B, H, T, D]
-        q = q.transpose(1, 2)  # [B, H, T, D]
-        k = k.transpose(1, 2)  # [B, H, T, D]
-        v = v.transpose(1, 2)  # [B, H, T, D]
-
-        # 应用旋转： (x * cos) + (rotate_half(x) * sin)
-        q = (q * cos) + (rotate_half(q) * sin)
-        k = (k * cos) + (rotate_half(k) * sin)
         
-        # === KV Cache拼接 ===
+        # 1. QKV投影
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        
+        # 2. Reshape
+        q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        
+        # 3. 应用NTK-RoPE
+        cos, sin = self.rotary_emb(q, seq_len)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        # 4. KV Cache
         if past_key_value is not None:
             past_k, past_v = past_key_value
-            k = torch.cat([past_k, k], dim=2)  # 拼到序列维
+            k = torch.cat([past_k, k], dim=2)
             v = torch.cat([past_v, v], dim=2)
         present_key_value = (k, v) if use_cache else None
-
-        # === 新增：GQA关键 - 扩展K/V头数以匹配Q ===
-        # 现状：k和v是 [B, 2, T, D]，q是 [B, 4, T, D]
-        # 需要：让k和v也变成 [B, 4, T, D]
-        if self.num_kv_groups > 1:  # 如果num_kv_groups=2，表示需要复制
-            # Step 1: 在第3维插入一个新维度
-            # k: [B, 2, T, D] → [B, 2, 1, T, D]
-            k = k.unsqueeze(2)
-            v = v.unsqueeze(2)
-            
-            # Step 2: 沿着新维度重复 num_kv_groups 次
-            # k: [B, 2, 1, T, D] → [B, 2, 2, T, D]（每个KV头复制2次）
-            k = k.repeat(1, 1, self.num_kv_groups, 1, 1)
-            v = v.repeat(1, 1, self.num_kv_groups, 1, 1)
-            
-            # Step 3: 合并成和Q一样的头数
-            # k: [B, 2, 2, T, D] → reshape → [B, 4, T, D]
-            # 结果：k[0,1]用原来的k[0]，k[2,3]用原来的k[1]
+        
+        # 5. GQA：扩展KV头
+        if self.num_kv_groups > 1:
+            k = k.unsqueeze(2).repeat(1, 1, self.num_kv_groups, 1, 1)
+            v = v.unsqueeze(2).repeat(1, 1, self.num_kv_groups, 1, 1)
             k = k.reshape(bsz, self.num_heads, -1, self.head_dim)
             v = v.reshape(bsz, self.num_heads, -1, self.head_dim)
-        # 现在 k 和 v 的形状是 [B, H, T, D]，和 q 对齐了
-
-        # 4. 计算注意力分数： Q * K^T / sqrt(D)
+        
+        # 6. Flash Attention
         try:
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=None,      # 不需要手动传mask
-                dropout_p=0.0,       # 暂时不用dropout
-                is_causal=True,      # 自动应用因果mask！
-                scale=None           # 自动缩放 1/sqrt(D)
-            )  # 输出: [B, H, T, D]
-        except Exception as e:
-            # 如果 scaled_dot_product_attention 不可用，回退到手动实现
-            attn_scores = torch.matmul(q, k.transpose(-2, -1))  # [B, H, T, T]
-            attn_scores = attn_scores / math.sqrt(self.head_dim)
-
-            # === 因果 mask：遮住右上角，让每个位置只能看见自己和左边 ===
-            # 构造一个 [T, T] 的矩阵，上三角（不含对角线）为 1，其它为 0
-            # 例如 T=4 时：
-            # [[0, 1, 1, 1],
-            #  [0, 0, 1, 1],
-            #  [0, 0, 0, 1],
-            #  [0, 0, 0, 0]]
-            seq_len = q.size(-2) #q的形状是[B, H, T, D]，所以seq_len是T
-            causal_mask = torch.triu(   #triu函数功能是返回一个上三角矩阵，对角线为1，其它为0
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=True
+            )
+        except:
+            # Fallback
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            causal_mask = torch.triu(
                 torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool),
                 diagonal=1
-            )  # [T, T], True 表示“要遮住”
-
-            # 把要遮住的位置加上一个非常大的负数（-1e9 或 -inf），softmax 后这些位置的概率≈0
+            )
             attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
-
-            # 5. 做 softmax 得到注意力权重
-            attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, H, T, T]
-
-            # 6. 用注意力权重加权 V，得到每个位置的聚合信息
-            attn_output = torch.matmul(attn_weights, v)  # [B, H, T, D]
-
-        # 7. 把 heads 维度挪回去，并合并回 hidden_size：
-        #    [B, H, T, D] -> [B, T, H, D] -> [B, T, H*D]
-        attn_output = attn_output.transpose(1, 2)  # [B, T, H, D]
-        attn_output = attn_output.reshape(bsz, seq_len, self.hidden_size)  # [B, T, C]
-
-        # 8. 过一个线性层，映射回 hidden_size（这一步是“输出投影”）
-        output = self.o_proj(attn_output)  # [B, T, C]
-
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+        
+        # 7. 输出
+        attn_output = attn_output.transpose(1, 2).reshape(bsz, seq_len, self.hidden_size)
+        output = self.o_proj(attn_output)
+        
         return output, present_key_value
 
 class LlamaForCausalLM(nn.Module):
@@ -475,3 +414,90 @@ class LlamaForCausalLM(nn.Module):
         """
         self.model.gradient_checkpointing = False
         print("✓ 已关闭梯度检查点（速度优先模式）")
+
+class GraphLlamaForCausalLM(nn.Module):
+    """
+    Graph-Enhanced Llama
+    论文参考：GreaseLM (ICLR 2022), GraphGPT (arXiv 2023)
+    """
+
+    def __init__(self, config: LlamaConfig, graph_config: Optional[dict] = None):
+        super().__init__()
+        self.config = config
+
+        # 1) 基座Llama
+        self.llama = LlamaForCausalLM(config)
+
+        # 2) 图模块
+        self.use_graph = graph_config is not None
+        if self.use_graph:
+            self.graph_encoder = GraphEncoder(
+                node_dim=graph_config.get("node_dim", config.hidden_size),
+                hidden_size=config.hidden_size,
+                num_layers=graph_config.get("num_layers", 3),
+                encoder_type=graph_config.get("encoder_type", "gat")
+            )
+            self.fusion = GraphTextFusion(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads
+            )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        graph_data: Optional[dict] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        use_cache: bool = False
+    ):
+        # 1) 文本embedding
+        text_emb = self.llama.model.embed_tokens(input_ids)  # [B, T, C]
+
+        # 2) 融合图信息（如果提供）
+        if self.use_graph and graph_data is not None:
+            node_emb, _ = self.graph_encoder(
+                graph_data["node_features"],
+                graph_data["edge_index"],
+                graph_data.get("batch", None)
+            )
+            # 扩展batch维度
+            if node_emb.dim() == 2:
+                node_emb = node_emb.unsqueeze(0).expand(text_emb.size(0), -1, -1)
+            # 融合
+            text_emb = self.fusion(text_emb, node_emb)
+
+        # 3) 替换embedding后继续Llama前向
+        hidden_states = self.llama.model.dropout(text_emb)
+
+        present_key_values = () if use_cache else None
+        for i, layer in enumerate(self.llama.model.layers):
+            past_kv = past_key_values[i] if past_key_values else None
+
+            if self.llama.model.gradient_checkpointing and self.training:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    lambda x: layer(x, use_cache=False)[0],
+                    hidden_states,
+                    use_reentrant=False
+                )
+                present_kv = None
+            else:
+                hidden_states, present_kv = layer(hidden_states, past_kv, use_cache)
+
+            if use_cache:
+                present_key_values = present_key_values + (present_kv,)
+
+        hidden_states = self.llama.model.norm(hidden_states)
+        logits = self.llama.lm_head(hidden_states)
+
+        if labels is None:
+            return (logits, present_key_values) if use_cache else logits
+
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        loss = torch.nn.functional.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100
+        )
+
+        return (loss, logits, present_key_values) if use_cache else (loss, logits)

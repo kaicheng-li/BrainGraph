@@ -30,6 +30,15 @@ class LlamaConfig:
     rms_norm_eps: float = 1e-5
     # RoPE 的 base，控制位置编码频率（Llama 用 1e4 或 1e6 一类的值）
     rope_theta: float = 10000.0
+    rope_scaling: Optional[dict]=None # {"type": "ntk", "factor": 4.0}
+    
+    # === LoRA配置 ===
+    use_lora: bool = False
+    lora_r: int = 8              # LoRA秩
+    lora_alpha: int = 16         # 缩放因子
+    lora_dropout: float = 0.05   # Dropout
+    lora_target_modules: Optional[list] = None  # 要应用LoRA的模块，如["q_proj", "v_proj"]
+    
     # 特殊 token 的 ID（这里先给一组常见默认值）
     bos_token_id: int = 1  # beginning of sentence
     eos_token_id: int = 2  # end of sentence
