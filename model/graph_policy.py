@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from model import GraphEncoder
+from .graph_encoder import GraphEncoder
 
 class GraphPolicy(nn.Module):
     """

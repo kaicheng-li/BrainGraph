@@ -4,12 +4,6 @@ from typing import Optional
 @dataclass
 class LlamaConfig:
     """
-    Llama风格 Decoder Only 模型配置.
-    It is used to specify the configuration of a Llama model.
-    """
-@dataclass
-class LlamaConfig:
-    """
     Llama 风格 Decoder-only Transformer 的配置类
     """
     # 词表大小（多少个 token ID）
@@ -32,6 +26,13 @@ class LlamaConfig:
     rope_theta: float = 10000.0
     rope_scaling: Optional[dict]=None # {"type": "ntk", "factor": 4.0}
     
+    # === Graph配置（新增） ===
+    use_graph: bool = False                    # ← 是否启用Graph模块
+    graph_node_dim: int = 64                   # ← Graph节点特征维度
+    graph_num_layers: int = 3                  # ← Graph编码器层数
+    graph_encoder_type: str = "gat"            # ← GCN或GAT
+    graph_use_lora: bool = False               # ← Graph是否用LoRA
+    
     # === LoRA配置 ===
     use_lora: bool = False
     lora_r: int = 8              # LoRA秩
@@ -43,3 +44,6 @@ class LlamaConfig:
     bos_token_id: int = 1  # beginning of sentence
     eos_token_id: int = 2  # end of sentence
     pad_token_id: int = 0  # padding
+    # === Tokenizer配置（新增）===
+    tokenizer_type: str = "tiktoken"  # "tiktoken" | "huggingface"
+    tokenizer_name: str = "cl100k_base"  # tiktoken编码名或HF模型名

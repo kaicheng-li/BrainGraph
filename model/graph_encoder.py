@@ -39,16 +39,24 @@ class GCNEncoder(nn.Module):
         node_dim: int,          # 输入节点特征维度
         hidden_size: int,       # 隐藏层维度（要和Llama的hidden_size对齐）
         num_layers: int = 3,    # GCN层数（论文推荐2-3层）
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_lora: bool = False,              # ← 从config传入
+        lora_r: int = 8,
+        gradient_checkpointing: bool = False # ← 从config传入
     ):
         super().__init__()
         
         self.node_dim = node_dim
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.gradient_checkpointing = gradient_checkpointing
         
         # 输入投影：把原始节点特征投影到hidden_size
-        self.input_proj = nn.Linear(node_dim, hidden_size)
+        if use_lora:
+            from model.lora import LoRALinear
+            self.input_proj = LoRALinear(node_dim, hidden_size, r=lora_r)
+        else:
+            self.input_proj = nn.Linear(node_dim, hidden_size)
         
         # GCN层堆叠
         # 论文发现：2-3层效果最好，太深会导致over-smoothing（所有节点变得相似）
@@ -92,18 +100,33 @@ class GCNEncoder(nn.Module):
         
         # Step 2: 逐层GCN传播
         for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
+            if self.gradient_checkpointing and self.training:
+                # Gradient Checkpointing优化（与Llama保持一致）
+                def create_forward(conv, norm):
+                    def forward(h):
+                        h_new = conv(h, edge_index)
+                        h_new = torch.relu(h_new)
+                        h_new = self.dropout(h_new)
+                        return norm(h + h_new)
+                    return forward
+                h = torch.utils.checkpoint.checkpoint(
+                    create_forward(conv, norm),
+                    h,
+                    use_reentrant=False
+                )
+            else:
             # GCN更新
-            h_new = conv(h, edge_index)  # [num_nodes, hidden_size]
+                h_new = conv(h, edge_index)  # [num_nodes, hidden_size]
+                
+                # 激活函数
+                h_new = torch.relu(h_new)
+                
+                # Dropout（防止过拟合）
+                h_new = self.dropout(h_new)
+                
+                # 残差连接（帮助深层网络训练）
+                h = norm(h + h_new)  # 残差 + Layer Norm
             
-            # 激活函数
-            h_new = torch.relu(h_new)
-            
-            # Dropout（防止过拟合）
-            h_new = self.dropout(h_new)
-            
-            # 残差连接（帮助深层网络训练）
-            h = norm(h + h_new)  # 残差 + Layer Norm
-        
         node_embeddings = h  # [num_nodes, hidden_size]
         
         # Step 3: 全局池化（把所有节点聚合成图级表示）
@@ -146,7 +169,10 @@ class GATEncoder(nn.Module):
         hidden_size: int,
         num_layers: int = 3,
         num_heads: int = 4,      # 多头注意力（类似Transformer）
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        use_lora: bool = False,
+        lora_r: int = 8,
+        gradient_checkpointing: bool = False
     ):
         super().__init__()
         
@@ -154,9 +180,14 @@ class GATEncoder(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.num_heads = num_heads
-        
-        # 输入投影
-        self.input_proj = nn.Linear(node_dim, hidden_size)
+        self.gradient_checkpointing = gradient_checkpointing
+
+        # 输入投影（支持LoRA）
+        if use_lora:
+            from model.lora import LoRALinear
+            self.input_proj = LoRALinear(node_dim, hidden_size, r=lora_r)
+        else:
+            self.input_proj = nn.Linear(node_dim, hidden_size)
         
         # GAT层
         # 注意：多头注意力，所以每个头输出 hidden_size // num_heads
@@ -184,12 +215,28 @@ class GATEncoder(nn.Module):
         
         # 逐层GAT传播
         for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
-            h_new = conv(h, edge_index)
-            h_new = torch.relu(h_new)
-            h_new = self.dropout(h_new)
-            
-            # 残差连接
-            h = norm(h + h_new)
+            if self.gradient_checkpointing and self.training:
+                # Gradient Checkpointing优化（与Llama保持一致）
+                def create_forward(conv, norm):
+                    def forward(h):
+                        h_new = conv(h, edge_index)
+                        h_new = torch.relu(h_new)
+                        h_new = self.dropout(h_new)
+                        return norm(h + h_new)
+                    return forward
+                h = torch.utils.checkpoint.checkpoint(
+                    create_forward(conv, norm),
+                    h,
+                    use_reentrant=False
+                )
+            else:
+                # GAT更新
+                h_new = conv(h, edge_index)
+                h_new = torch.relu(h_new)
+                h_new = self.dropout(h_new)
+                
+                # 残差连接
+                h = norm(h + h_new)
         
         node_embeddings = h
         
@@ -221,6 +268,9 @@ class GraphEncoder(nn.Module):
         hidden_size: int,
         num_layers: int = 3,
         encoder_type: str = 'gat',  # 'gcn' or 'gat'
+        use_lora: bool = False,              # ← 从config传入
+        lora_r: int = 8,
+        gradient_checkpointing: bool = False # ← 从config传入
         **kwargs
     ):
         super().__init__()
@@ -230,6 +280,9 @@ class GraphEncoder(nn.Module):
                 node_dim=node_dim,
                 hidden_size=hidden_size,
                 num_layers=num_layers,
+                use_lora=use_lora,
+                lora_r=lora_r,
+                gradient_checkpointing=gradient_checkpointing,
                 **kwargs
             )
         elif encoder_type == 'gat':
@@ -237,6 +290,9 @@ class GraphEncoder(nn.Module):
                 node_dim=node_dim,
                 hidden_size=hidden_size,
                 num_layers=num_layers,
+                use_lora=use_lora,
+                lora_r=lora_r,
+                gradient_checkpointing=gradient_checkpointing,
                 **kwargs
             )
         else:

@@ -421,7 +421,7 @@ class GraphLlamaForCausalLM(nn.Module):
     论文参考：GreaseLM (ICLR 2022), GraphGPT (arXiv 2023)
     """
 
-    def __init__(self, config: LlamaConfig, graph_config: Optional[dict] = None):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
 
@@ -429,18 +429,22 @@ class GraphLlamaForCausalLM(nn.Module):
         self.llama = LlamaForCausalLM(config)
 
         # 2) 图模块
-        self.use_graph = graph_config is not None
-        if self.use_graph:
-            self.graph_encoder = GraphEncoder(
-                node_dim=graph_config.get("node_dim", config.hidden_size),
-                hidden_size=config.hidden_size,
-                num_layers=graph_config.get("num_layers", 3),
-                encoder_type=graph_config.get("encoder_type", "gat")
-            )
-            self.fusion = GraphTextFusion(
-                hidden_size=config.hidden_size,
-                num_heads=config.num_attention_heads
-            )
+self.use_graph = config.use_graph  # ✅ 从config取
+if self.use_graph:
+    self.graph_encoder = GraphEncoder(
+        node_dim=config.graph_node_dim,  # ✅ 从config取
+        hidden_size=config.hidden_size,
+        num_layers=config.graph_num_layers,  # ✅
+        encoder_type=config.graph_encoder_type,  # ✅
+        use_lora=config.graph_use_lora if config.graph_use_lora is not None else config.use_lora,  # ✅ 继承
+        lora_r=config.lora_r,  # ✅
+        gradient_checkpointing=self.llama.model.gradient_checkpointing  # ✅ 继承
+    )
+    self.fusion = GraphTextFusion(
+        hidden_size=config.hidden_size,
+        num_heads=config.num_attention_heads,
+        use_flash_attention=True  # ✅ 和Llama保持一致
+    )
 
     def forward(
         self,

@@ -263,7 +263,7 @@ def main():
     checkpoint_path = "./checkpoints/final_policy.pt"
     if os.path.exists(checkpoint_path):
         print(f"\n加载checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(checkpoint_path, map_location=device,weights_only=False)
         
         policy = GraphPolicy(
             node_dim=64,

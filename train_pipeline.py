@@ -1,109 +1,133 @@
 """
 完整训练流程：SFT → RL（PPO）
-支持LoRA微调 + NTK-RoPE长上下文
+真正的知识迁移：GraphLlama的graph_encoder → GraphPolicy
 
 流程：
-1. Stage 1：SFT预训练（图推理任务监督学习）
-2. Stage 2：保存SFT checkpoint
-3. Stage 3：加载SFT模型，用PPO优化策略
+1. Stage 1：SFT训练GraphLlamaForCausalLM（学习图推理的文本描述）
+2. Stage 2：提取graph_encoder权重
+3. Stage 3：用SFT的graph_encoder初始化RL的policy，继续PPO优化
 """
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
-from model.llama_model import LlamaForCausalLM, GraphLlamaForCausalLM
+from model.llama_model import GraphLlamaForCausalLM
 from model.llama_config import LlamaConfig
 from model.lora import mark_only_lora_as_trainable, LoRALinear, get_lora_state_dict
 from model.graph_policy import GraphPolicy
 from model.graph_mission import build_path_task
 from model.graph_utils import build_adj_list
+from torch_geometric.data import Data
 import os
 from typing import Optional
+from model.tokenizer import get_tokenizer
 
 # ============================================
-# Stage 1: SFT训练函数
+# Stage 1: SFT训练函数（使用GraphLlama）
 # ============================================
 
-def create_graph_sft_data():
-    """生成图推理的SFT训练数据"""
-    samples = [
-        {
-            "prompt": "图结构: 节点0→1→4→5, 节点0→2→5. 问题: 从0到5的最短路径?",
-            "completion": "分析: 路径1是0→1→4→5(3步), 路径2是0→2→5(2步). 答案: 0→2→5"
-        },
-        {
-            "prompt": "图: 边[(0,1),(1,2),(2,3),(0,3)]. 问: 节点0到3有几条路径?",
-            "completion": "有2条路径: ①0→1→2→3(3步) ②0→3(1步，最短)"
-        },
-        {
-            "prompt": "图: 5节点完全图. 问: 从节点0出发，访问所有节点的最短步数?",
-            "completion": "完全图中任意两点直连，访问5个节点最少需要4步(从0到1,2,3,4)"
-        },
-        # 添加更多样本提高泛化
-        {
-            "prompt": "图: 链状0-1-2-3-4. 问: 0到4的路径?",
-            "completion": "唯一路径: 0→1→2→3→4(4步)"
-        },
-        {
-            "prompt": "图: 环状0→1→2→3→0. 问: 从0回到0需要几步?",
-            "completion": "顺时针: 0→1→2→3→0(4步), 这是唯一路径"
-        }
-    ]
-    return samples * 20  # 复制20次增加训练数据量
+def create_graph_sft_data_with_structure():
+    """
+    加载图推理训练数据（JSONL格式）
+    
+    返回格式：List[Dict]，每个字典包含：
+    {
+        "prompt": str,           # 问题文本
+        "completion": str,       # 答案文本
+        "graph": Data           # PyG图对象 (x, edge_index)
+    }
+    """
+    import json
+    
+    # ============================================
+    # 👇 修改这里：你的JSONL文件路径
+    # ============================================
+    data_path = "./data/graph_dataset.jsonl"
+    
+    # ============================================
+    # 加载JSONL文件
+    # ============================================
+    samples = []
+    with open(data_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():  # 跳过空行
+                samples.append(json.loads(line))
+    
+    print(f"加载了 {len(samples)} 条数据")
+    
+    # ============================================
+    # 👇 数据格式转换（根据你的JSONL字段调整）
+    # ============================================
+    processed_samples = []
+    for item in samples:
+        processed_samples.append({
+            "prompt": item['prompt'],              # 改成你数据的字段名
+            "completion": item['completion'],      # 改成你数据的字段名
+            "graph": Data(
+                x=torch.tensor(item['node_features'], dtype=torch.float),
+                edge_index=torch.tensor(item['edge_index'], dtype=torch.long)
+            )
+        })
+    
+    return processed_samples
 
-def tokenize_sft_sample(prompt: str, completion: str, vocab_size: int, max_len: int = 128):
-    """简化的token化（实际应用需要真实tokenizer）"""
-    # 字符级编码
-    def encode(text):
-        return [min(ord(c) % vocab_size, vocab_size-1) for c in text]
+def tokenize_sft(prompt: str, completion: str, tokenizer, max_len: int = 128):
+    """简化token化"""
+    # 编码
+    prompt_ids = tokenizer.encode(prompt)
+    completion_ids = tokenizer.encode(completion)
     
-    prompt_tokens = encode(prompt)[:max_len//2]
-    completion_tokens = encode(completion)[:max_len//2]
+    # 拼接
+    input_ids = prompt_ids + completion_ids
+    labels = [-100] * len(prompt_ids) + completion_ids
     
-    input_ids = prompt_tokens + completion_tokens
-    labels = [-100] * len(prompt_tokens) + completion_tokens
+    # Truncate
+    if len(input_ids) > max_len:
+        input_ids = input_ids[:max_len]
+        labels = labels[:max_len]
     
     # Padding
     if len(input_ids) < max_len:
         pad_len = max_len - len(input_ids)
-        input_ids += [0] * pad_len
+        input_ids += [tokenizer.pad_token_id] * pad_len
         labels += [-100] * pad_len
     
     return {
-        "input_ids": torch.tensor(input_ids[:max_len], dtype=torch.long),
-        "labels": torch.tensor(labels[:max_len], dtype=torch.long)
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long)
     }
 
 def sft_train_stage(
     config: LlamaConfig,
+    tokenizer,
     num_epochs: int = 5,
     batch_size: int = 4,
     learning_rate: float = 3e-4,
     use_lora: bool = True,
     checkpoint_dir: str = "./checkpoints"
 ):
-    """Stage 1: SFT训练"""
+
+    """Stage 1: SFT训练GraphLlamaForCausalLM"""
     print("\n" + "="*60)
-    print("📚 Stage 1: Supervised Fine-Tuning (SFT)")
+    print(" Stage 1: SFT训练 (GraphLlama)")
     print("="*60)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 1. 创建模型
-    model = LlamaForCausalLM(config).to(device)
+    # 1. 创建GraphLlama模型（重点：有graph_encoder）
+    model = GraphLlamaForCausalLM(config).to(device)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"模型总参数: {total_params/1e6:.2f}M")
+    print(f"模型: GraphLlamaForCausalLM")
+    print(f"总参数: {total_params/1e6:.2f}M")
     
-    # 2. 应用LoRA（如果启用）
+    # 2. 应用LoRA
     if use_lora:
-        # 替换Linear为LoRALinear
         apply_lora_to_model(model, config)
         mark_only_lora_as_trainable(model, bias='none')
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"LoRA可训练参数: {trainable_params/1e6:.2f}M ({100*trainable_params/total_params:.2f}%)")
+        print(f"LoRA可训练: {trainable_params/1e6:.2f}M ({100*trainable_params/total_params:.2f}%)")
     
-    # 3. 准备数据
-    samples = create_graph_sft_data()
-    print(f"训练样本数: {len(samples)}")
+    # 3. 准备数据（带图结构）
+    samples = create_graph_sft_data_with_structure()
+    print(f"训练样本: {len(samples)}")
     
     # 4. 优化器
     optimizer = torch.optim.AdamW(
@@ -124,15 +148,21 @@ def sft_train_stage(
             
             # 构造batch
             batch_data = [
-                tokenize_sft_sample(s["prompt"], s["completion"], config.vocab_size)
+                tokenize_sft(s["prompt"], s["completion"], tokenizer)  # ← 传tokenizer
                 for s in batch_samples
             ]
             input_ids = torch.stack([d["input_ids"] for d in batch_data]).to(device)
             labels = torch.stack([d["labels"] for d in batch_data]).to(device)
             
+            # 图数据（简化：用第一个样本的图）
+            graph_data = {
+                "node_features": batch_samples[0]["graph"].x.to(device),
+                "edge_index": batch_samples[0]["graph"].edge_index.to(device)
+            }
+            
             # 前向+反向
             optimizer.zero_grad()
-            loss, logits = model(input_ids, labels=labels)
+            loss, logits = model(input_ids, labels=labels, graph_data=graph_data)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -143,50 +173,39 @@ def sft_train_stage(
         avg_loss = total_loss / num_batches
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
     
-    # 6. 保存checkpoint
+    # 6. 保存完整模型（包含graph_encoder）
+    model.eval()
     os.makedirs(checkpoint_dir, exist_ok=True)
-    if use_lora:
-        # 只保存LoRA权重
-        checkpoint = {
-            "lora_state_dict": get_lora_state_dict(model),
-            "config": config
-        }
-        save_path = os.path.join(checkpoint_dir, "sft_lora.pt")
-    else:
-        checkpoint = {
-            "model_state_dict": model.state_dict(),
-            "config": config
-        }
-        save_path = os.path.join(checkpoint_dir, "sft_full.pt")
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "config": config
+    }
+    save_path = os.path.join(checkpoint_dir, "sft_graphllama.pt")
     
     torch.save(checkpoint, save_path)
-    print(f"\n[OK] SFT训练完成，checkpoint保存至: {save_path}\n")
+    print(f"\n SFT完成，checkpoint: {save_path}")
+    print(f"   包含graph_encoder权重（将迁移到RL）\n")
     
     return model, save_path
 
 # ============================================
-# Stage 2: RL（PPO）训练函数
+# Stage 2: RL训练（继承graph_encoder）
 # ============================================
 
 def rl_train_stage(
     sft_checkpoint_path: str,
-    config: LlamaConfig,
-    num_episodes: int = 500,
+    num_episodes: int = 300,
     learning_rate: float = 1e-4,
-    use_lora: bool = True
+    use_sft_init: bool = True
 ):
-    """Stage 2: 基于SFT模型的RL训练"""
+    """Stage 2: RL训练（继承SFT的graph_encoder）"""
     print("\n" + "="*60)
-    print(" Stage 2: Reinforcement Learning (PPO)")
+    print(" Stage 2: RL训练 (PPO)")
     print("="*60)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 1. 加载SFT checkpoint
-    print(f"加载SFT checkpoint: {sft_checkpoint_path}")
-    checkpoint = torch.load(sft_checkpoint_path, map_location=device)
-    
-    # 2. 创建策略网络
+    # 1. 创建策略网络
     policy = GraphPolicy(
         node_dim=64,
         hidden_size=128,
@@ -194,12 +213,37 @@ def rl_train_stage(
         encoder_type="gat"
     ).to(device)
     
-    # 可选：用SFT的graph encoder初始化policy
-    # 这里简化处理，实际可以共享编码器权重
-    
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=learning_rate)
+    # 2. 加载SFT的graph_encoder权重（核心！）
+    if use_sft_init and os.path.exists(sft_checkpoint_path):
+        print(f"加载SFT checkpoint: {sft_checkpoint_path}")
+        checkpoint = torch.load(sft_checkpoint_path, map_location=device, weights_only=False)
+        sft_state = checkpoint['model_state_dict']
+        
+        # 提取graph_encoder权重
+        policy_state = policy.state_dict()
+        transferred = 0
+        
+        for name, param in sft_state.items():
+            # GraphLlama的graph_encoder → Policy的encoder
+            if 'graph_encoder' in name:
+                # 去掉前缀 'graph_encoder.' 映射到 policy 的 'encoder.'
+                new_name = name.replace('graph_encoder', 'encoder')
+                if new_name in policy_state and param.shape == policy_state[new_name].shape:
+                    policy_state[new_name] = param.clone()
+                    transferred += 1
+        
+        if transferred > 0:
+            policy.load_state_dict(policy_state)
+            print(f" 成功迁移 {transferred} 个graph_encoder参数")
+            print(f"   Policy现在具备SFT学到的图理解能力！")
+        else:
+            print("  未找到匹配的graph_encoder权重，使用随机初始化")
+    else:
+        print("使用随机初始化（无SFT预训练）")
     
     # 3. PPO训练
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=learning_rate)
+    
     task = build_path_task()
     graph = task["graph"]
     num_nodes = graph.x.size(0)
@@ -208,7 +252,7 @@ def rl_train_stage(
     clip_epsilon = 0.2
     ppo_epochs = 4
     
-    print(f"开始PPO训练，总episodes: {num_episodes}")
+    print(f"\n开始PPO训练，episodes: {num_episodes}")
     
     for episode in range(num_episodes):
         current = task["start"]
@@ -223,7 +267,6 @@ def rl_train_stage(
         for step in range(max_steps):
             logits = policy(graph.x, graph.edge_index, current, goal)
             
-            # Mask非邻居节点
             mask = torch.full_like(logits, float("-inf"))
             for n in adj[current]:
                 mask[n] = 0.0
@@ -233,7 +276,6 @@ def rl_train_stage(
             next_node = torch.multinomial(probs, num_samples=1).item()
             old_log_prob = torch.log(probs[next_node] + 1e-9)
             
-            # 奖励
             reward = -0.01
             if next_node == goal:
                 reward += 1.0
@@ -252,7 +294,7 @@ def rl_train_stage(
             if current == goal:
                 break
         
-        # 额外奖励（路径对齐）
+        # 路径对齐奖励
         gold_path = [int(x.strip()) for x in task["gold_path"].split("->")]
         if path_nodes == gold_path:
             rewards[-1] += 0.5
@@ -298,20 +340,18 @@ def rl_train_stage(
                 optimizer.step()
         
         if (episode + 1) % 50 == 0:
-            print(f"Episode {episode+1}/{num_episodes}, "
-                  f"Steps: {len(path_nodes)}, "
-                  f"Reached goal: {current == goal}, "
-                  f"Total reward: {sum(rewards):.2f}")
+            print(f"Episode {episode+1}, Steps: {len(path_nodes)}, "
+                  f"Goal: {current == goal}, Reward: {sum(rewards):.2f}")
     
-    print("\n[OK] RL训练完成\n")
+    print("\n RL训练完成\n")
     return policy
 
 # ============================================
-# LoRA应用辅助函数
+# LoRA辅助函数
 # ============================================
 
-def apply_lora_to_model(model: LlamaForCausalLM, config: LlamaConfig):
-    """将模型的Linear层替换为LoRALinear"""
+def apply_lora_to_model(model, config: LlamaConfig):
+    """应用LoRA到模型"""
     if not config.use_lora:
         return
     
@@ -319,15 +359,17 @@ def apply_lora_to_model(model: LlamaForCausalLM, config: LlamaConfig):
     
     def replace_linear(module, name=""):
         for attr_name in dir(module):
-            target_attr = getattr(module, attr_name)
+            try:
+                target_attr = getattr(module, attr_name)
+            except:
+                continue
+                
             if isinstance(target_attr, torch.nn.Linear):
-                # 检查是否在目标模块列表中
                 if any(target in attr_name for target in target_modules):
                     in_features = target_attr.in_features
                     out_features = target_attr.out_features
                     bias = target_attr.bias is not None
                     
-                    # 创建LoRALinear替换
                     lora_layer = LoRALinear(
                         in_features=in_features,
                         out_features=out_features,
@@ -337,19 +379,15 @@ def apply_lora_to_model(model: LlamaForCausalLM, config: LlamaConfig):
                         bias=bias
                     )
                     
-                    # 复制原权重
                     lora_layer.weight.data = target_attr.weight.data.clone()
                     if bias:
                         lora_layer.bias.data = target_attr.bias.data.clone()
                     
                     setattr(module, attr_name, lora_layer)
-                    print(f"  ✓ 替换 {name}.{attr_name} 为 LoRALinear")
         
-        # 递归处理子模块
         for child_name, child_module in module.named_children():
             replace_linear(child_module, f"{name}.{child_name}" if name else child_name)
     
-    print("应用LoRA到模型:")
     replace_linear(model)
 
 # ============================================
@@ -357,63 +395,123 @@ def apply_lora_to_model(model: LlamaForCausalLM, config: LlamaConfig):
 # ============================================
 
 def main():
-    """完整训练流程"""
+    """完整训练流程：SFT → RL 知识迁移"""
     print("\n" + "="*60)
-    print(" AI+RL+Graph 完整训练流程")
+    print("AI+RL+Graph 完整训练流程")
+    print("知识迁移: SFT的graph_encoder → RL的policy")
     print("="*60)
     
     # 配置
     config = LlamaConfig(
         vocab_size=1000,
-        hidden_size=256,
+        hidden_size=128,  # 与graph_encoder对齐
         num_hidden_layers=4,
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=512,
-        # NTK-RoPE配置
-        rope_scaling={"type": "ntk", "factor": 2.0},
-        # LoRA配置
         use_lora=True,
         lora_r=8,
         lora_alpha=16,
         lora_dropout=0.05,
-        lora_target_modules=["q_proj", "v_proj", "o_proj"]
+        lora_target_modules=["q_proj", "v_proj"],
+        tokenizer_type="tiktoken",      # 或 "huggingface"
+        tokenizer_name="cl100k_base",   # 或 "Qwen/Qwen-7B" 或 "gpt2"
+        # ← 新增Graph配置
+        use_graph=True,
+        graph_node_dim=64,
+        graph_num_layers=2,
+        graph_encoder_type="gat"
     )
+
+    # 2. 根据config创建tokenizer
+    print(f"\n初始化 {config.tokenizer_type} Tokenizer...")
     
-    # Stage 1: SFT
+    if config.tokenizer_type == "tiktoken":
+        tokenizer = get_tokenizer("tiktoken", encoding_name=config.tokenizer_name)
+    elif config.tokenizer_type == "huggingface":
+        tokenizer = get_tokenizer("huggingface", model_name=config.tokenizer_name)
+    else:
+        raise ValueError(f"不支持的tokenizer类型: {config.tokenizer_type}")
+    
+    # 3. 同步vocab_size到config
+    config.vocab_size = tokenizer.vocab_size
+    print(f" Tokenizer加载完成，vocab_size={config.vocab_size}")
+    
+    # Stage 1: SFT（训练GraphLlama）
     model, sft_path = sft_train_stage(
         config=config,
+        tokenizer=tokenizer,
         num_epochs=5,
-        batch_size=4,
+        batch_size=2,
         learning_rate=3e-4,
         use_lora=True
     )
     
-    # Stage 2: RL
+    # Stage 2: RL（继承graph_encoder）
     policy = rl_train_stage(
         sft_checkpoint_path=sft_path,
-        config=config,
-        num_episodes=300,
+        num_episodes=200,
         learning_rate=1e-4,
-        use_lora=True
+        use_sft_init=True
     )
     
-    # 保存最终模型
+    # 保存最终策略
+    os.makedirs("./checkpoints", exist_ok=True)
     torch.save({
-        "policy_state_dict": policy.state_dict(),
-        "config": config
+        "policy_state_dict": policy.state_dict()
     }, "./checkpoints/final_policy.pt")
     
     print("\n" + "="*60)
-    print(" 训练流程全部完成！")
+    print("🎉 训练完成！")
     print("="*60)
-    print("\n模型文件:")
-    print("  - SFT checkpoint: ./checkpoints/sft_lora.pt")
-    print("  - Final policy: ./checkpoints/final_policy.pt")
-    print("\n下一步:")
-    print("  1. 运行评估脚本测试性能")
-    print("  2. 可视化训练曲线")
-    print("  3. 尝试更复杂的图任务（如旅行商问题TSP）\n")
+    print("\n文件:")
+    print("  - SFT: ./checkpoints/sft_graphllama.pt")
+    print("  - RL:  ./checkpoints/final_policy.pt")
+    print("\n下一步: python eval_complete.py\n")
 
 if __name__ == "__main__":
-    main()
+    import sys
+    
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+        
+        config = LlamaConfig(
+            vocab_size=1000,
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            use_lora=True,
+            lora_r=8,
+            lora_alpha=16,
+            lora_dropout=0.05,
+            lora_target_modules=["q_proj", "v_proj"],
+            tokenizer_type="tiktoken",
+            tokenizer_name="cl100k_base",
+            # Graph配置
+            use_graph=True,
+            graph_node_dim=64,
+            graph_num_layers=2,
+            graph_encoder_type="gat"
+        )
+        
+        if mode == "sft":
+            print("\n🎯 模式：仅SFT\n")
+            # 创建tokenizer
+            tokenizer = get_tokenizer(
+                config.tokenizer_type, 
+                encoding_name=config.tokenizer_name if config.tokenizer_type == "tiktoken" else None,
+                model_name=config.tokenizer_name if config.tokenizer_type != "tiktoken" else None
+            )
+            config.vocab_size = tokenizer.vocab_size
+            sft_train_stage(config, tokenizer, num_epochs=5)
+            
+        elif mode == "rl":
+            print("\n🎯 模式：仅RL\n")
+            sft_path = "./checkpoints/sft_graphllama.pt"
+            rl_train_stage(sft_path, num_episodes=200)
+            
+        else:
+            print(f"用法: python train_pipeline.py [sft|rl]")
+    else:
+        main()

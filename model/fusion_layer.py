@@ -7,11 +7,12 @@ class GraphTextFusion(nn.Module):
     作用：让文本token通过Cross-Attention“看到”图节点
     """
 
-    def __init__(self, hidden_size: int, num_heads: int = 8):
+    def __init__(self, hidden_size: int, num_heads: int = 8, use_flash_attention: bool = False):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.use_flash_attention = use_flash_attention
 
         assert hidden_size % num_heads == 0, "hidden_size必须能整除num_heads"
 
@@ -43,9 +44,25 @@ class GraphTextFusion(nn.Module):
         v = v.view(bsz, num_nodes, self.num_heads, self.head_dim).transpose(1, 2) # [B,H,N,D]
 
         # 3) Cross-Attention: 文本查询图节点
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [B,H,T,N]
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_output = torch.matmul(attn_weights, v)  # [B,H,T,D]
+        if self.use_flash_attention:
+            try:
+                # Flash Attention优化（与Llama保持一致）
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=False  # Cross-Attention无因果mask
+                )
+            except:
+                # Fallback to manual implementation
+                attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+                attn_weights = torch.softmax(attn_scores, dim=-1)
+                attn_output = torch.matmul(attn_weights, v)
+        else:
+            # Manual attention (原始实现)
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [B,H,T,N]
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)  # [B,H,T,D]
 
         # 4) 合并多头
         attn_output = attn_output.transpose(1, 2).reshape(bsz, seq_len, self.hidden_size)
