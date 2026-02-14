@@ -429,22 +429,22 @@ class GraphLlamaForCausalLM(nn.Module):
         self.llama = LlamaForCausalLM(config)
 
         # 2) 图模块
-self.use_graph = config.use_graph  # ✅ 从config取
-if self.use_graph:
-    self.graph_encoder = GraphEncoder(
-        node_dim=config.graph_node_dim,  # ✅ 从config取
-        hidden_size=config.hidden_size,
-        num_layers=config.graph_num_layers,  # ✅
-        encoder_type=config.graph_encoder_type,  # ✅
-        use_lora=config.graph_use_lora if config.graph_use_lora is not None else config.use_lora,  # ✅ 继承
-        lora_r=config.lora_r,  # ✅
-        gradient_checkpointing=self.llama.model.gradient_checkpointing  # ✅ 继承
-    )
-    self.fusion = GraphTextFusion(
-        hidden_size=config.hidden_size,
-        num_heads=config.num_attention_heads,
-        use_flash_attention=True  # ✅ 和Llama保持一致
-    )
+        self.use_graph = config.use_graph  # ✅ 从config取
+        if self.use_graph:
+            self.graph_encoder = GraphEncoder(
+                node_dim=config.graph_node_dim,  # ✅ 从config取
+                hidden_size=config.hidden_size,
+                num_layers=config.graph_num_layers,  # ✅
+                encoder_type=config.graph_encoder_type,  # ✅
+                use_lora=config.graph_use_lora if config.graph_use_lora is not None else config.use_lora,  # ✅ 继承
+                lora_r=config.lora_r,  # ✅
+                gradient_checkpointing=self.llama.model.gradient_checkpointing  # ✅ 继承
+            )
+            self.fusion = GraphTextFusion(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                use_flash_attention=True  # ✅ 和Llama保持一致
+            )
 
     def forward(
         self,

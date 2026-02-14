@@ -24,7 +24,7 @@ from trainer.trainer_utils import (
     get_lr, Logger, is_main_process, lm_checkpoint,
     init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 )
-
+import wandb as wandb_lib
 warnings.filterwarnings('ignore')
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
@@ -192,7 +192,6 @@ if __name__ == "__main__":
     # ========== 4. wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
-        import wandb as wandb_lib
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"GraphSFT-E{args.epochs}-BS{args.batch_size}-LR{args.learning_rate}"
