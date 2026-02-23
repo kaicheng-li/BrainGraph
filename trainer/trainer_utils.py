@@ -212,7 +212,7 @@ def init_model(config, from_weight='none', device='cuda'):
     # ========== 2. 初始化tokenizer ==========
     tokenizer_type = getattr(config, 'tokenizer_type', 'tiktoken')
     tokenizer_name = getattr(config, 'tokenizer_name', 'gpt-4')
-    tokenizer = get_tokenizer(tokenizer_type, tokenizer_name)
+    tokenizer = get_tokenizer(tokenizer_type, model_name=tokenizer_name)
     
     # 更新config的vocab_size（以tokenizer实际大小为准）
     config.vocab_size = tokenizer.vocab_size

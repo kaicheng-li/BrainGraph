@@ -9,6 +9,10 @@ LLaMA预训练（MiniMind架构 + 原有优化）
 import argparse
 import os
 import sys
+__package__ = "trainer"
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT) 
 import warnings
 import time
 import torch
@@ -131,7 +135,7 @@ if __name__ == "__main__":
                         help="是否启用梯度检查点（节省显存）")
     
     # === 数据 ===
-    parser.add_argument("--data_path", type=str, default="./data/pretrain/", help="预训练数据路径")
+    parser.add_argument("--data_path", type=str, default="./datasets/", help="预训练数据路径")
     
     # === 权重和续训 ===
     parser.add_argument('--from_weight', default='none', type=str, help="基础权重")

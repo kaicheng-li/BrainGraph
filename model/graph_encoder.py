@@ -270,7 +270,7 @@ class GraphEncoder(nn.Module):
         encoder_type: str = 'gat',  # 'gcn' or 'gat'
         use_lora: bool = False,              # ← 从config传入
         lora_r: int = 8,
-        gradient_checkpointing: bool = False # ← 从config传入
+        gradient_checkpointing: bool = False, # ← 从config传入
         **kwargs
     ):
         super().__init__()

@@ -1,0 +1,29 @@
+# Core ML
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# Graph library (PyTorch Geometric) - install separately with wheels if needed
+torch-geometric>=2.3.0
+
+# Tokenizers & tokenizer backends
+tiktoken>=0.4.0
+transformers>=4.40.0
+sentencepiece>=0.1.99
+
+# LoRA / quantization helpers
+bitsandbytes>=0.39.0
+
+# Data & utils
+datasets>=2.18.0
+numpy>=1.25.0
+tqdm>=4.65.0
+
+# Logging / experiment tracking
+wandb>=0.15.0
+
+# Optional but useful
+einops>=0.6.0
+scipy>=1.11.0
+tensorboard>=2.15.0
+psutil>=5.9.0

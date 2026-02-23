@@ -7,6 +7,8 @@ Graph+LLM SFT训练（对标MiniMind）
 import argparse
 import os
 import sys
+__package__ = "trainer"
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import warnings
 import time
 import torch

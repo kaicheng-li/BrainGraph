@@ -11,7 +11,9 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from pathlib import Path
 import os
-
+import sys
+__package__ = "trainer"
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from model.graph_policy import GraphPolicy
 from model.graph_mission import build_path_task
 from model.graph_utils import build_adj_list

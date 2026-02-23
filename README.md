@@ -787,11 +787,6 @@ python train_graph_sft.py \
 
 ---
 
-## 📧 联系方式
-
-- **Issue追踪**: [GitHub Issues](https://github.com/your-repo/issues)
-- **讨论区**: [GitHub Discussions](https://github.com/your-repo/discussions)
-
 ---
 
 ## 📄 许可证
